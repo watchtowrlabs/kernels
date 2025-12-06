@@ -33,6 +33,28 @@ struct opal_takeover_args {
 	u64	rd_loc;			/* r11 */
 };
 
+/*
+ * SG entry
+ *
+ * WARNING: The current implementation requires each entry
+ * to represent a block that is 4k aligned *and* each block
+ * size except the last one in the list to be as well.
+ */
+struct opal_sg_entry {
+	void    *data;
+	long    length;
+};
+
+/* sg list */
+struct opal_sg_list {
+	unsigned long num_entries;
+	struct opal_sg_list *next;
+	struct opal_sg_entry entry[];
+};
+
+/* We calculate number of sg entries based on PAGE_SIZE */
+#define SG_ENTRIES_PER_NODE ((PAGE_SIZE - 16) / sizeof(struct opal_sg_entry))
+
 extern long opal_query_takeover(u64 *hal_size, u64 *hal_align);
 
 extern long opal_do_takeover(struct opal_takeover_args *args);
@@ -130,9 +152,23 @@ extern int opal_enter_rtas(struct rtas_args *args,
 #define OPAL_LPC_WRITE				68
 #define OPAL_RETURN_CPU				69
 #define OPAL_REINIT_CPUS			70
+#define OPAL_ELOG_READ				71
+#define OPAL_ELOG_WRITE				72
+#define OPAL_ELOG_ACK				73
+#define OPAL_ELOG_RESEND			74
+#define OPAL_ELOG_SIZE				75
 #define OPAL_FLASH_VALIDATE			76
 #define OPAL_FLASH_MANAGE			77
 #define OPAL_FLASH_UPDATE			78
+#define OPAL_DUMP_INIT				81
+#define OPAL_DUMP_INFO				82
+#define OPAL_DUMP_READ				83
+#define OPAL_DUMP_ACK				84
+#define OPAL_GET_MSG				85
+#define OPAL_CHECK_ASYNC_COMPLETION		86
+#define OPAL_DUMP_RESEND			91
+#define OPAL_SYNC_HOST_REBOOT			87
+#define OPAL_DUMP_INFO2				94
 
 #ifndef __ASSEMBLY__
 
@@ -212,7 +248,17 @@ enum OpalPendingState {
 	OPAL_EVENT_ERROR_LOG		= 0x40,
 	OPAL_EVENT_EPOW			= 0x80,
 	OPAL_EVENT_LED_STATUS		= 0x100,
-	OPAL_EVENT_PCI_ERROR		= 0x200
+	OPAL_EVENT_PCI_ERROR		= 0x200,
+	OPAL_EVENT_DUMP_AVAIL		= 0x400,
+	OPAL_EVENT_MSG_PENDING		= 0x800,
+};
+
+enum OpalMessageType {
+	OPAL_MSG_ASYNC_COMP		= 0,
+	OPAL_MSG_MEM_ERR,
+	OPAL_MSG_EPOW,
+	OPAL_MSG_SHUTDOWN,
+	OPAL_MSG_TYPE_MAX,
 };
 
 /* Machine check related definitions */
@@ -734,9 +780,22 @@ int64_t opal_lpc_write(uint32_t chip_id, enum OpalLPCAddressType addr_type,
 		       uint32_t addr, uint32_t data, uint32_t sz);
 int64_t opal_lpc_read(uint32_t chip_id, enum OpalLPCAddressType addr_type,
 		      uint32_t addr, __be32 *data, uint32_t sz);
+
+int64_t opal_read_elog(uint64_t buffer, size_t size, uint64_t log_id);
+int64_t opal_get_elog_size(uint64_t *log_id, size_t *size, uint64_t *elog_type);
+int64_t opal_write_elog(uint64_t buffer, uint64_t size, uint64_t offset);
+int64_t opal_send_ack_elog(uint64_t log_id);
+void opal_resend_pending_logs(void);
+
 int64_t opal_validate_flash(uint64_t buffer, uint32_t *size, uint32_t *result);
 int64_t opal_manage_flash(uint8_t op);
 int64_t opal_update_flash(uint64_t blk_list);
+int64_t opal_dump_init(uint8_t dump_type);
+int64_t opal_dump_info(uint32_t *dump_id, uint32_t *dump_size);
+int64_t opal_dump_info2(uint32_t *dump_id, uint32_t *dump_size, uint32_t *dump_type);
+int64_t opal_dump_read(uint32_t dump_id, uint64_t buffer);
+int64_t opal_dump_ack(uint32_t dump_id);
+int64_t opal_dump_resend_notification(void);
 
 /* Internal functions */
 extern int early_init_dt_scan_opal(unsigned long node, const char *uname, int depth, void *data);
@@ -768,6 +827,8 @@ extern void opal_get_rtc_time(struct rtc_time *tm);
 extern unsigned long opal_get_boot_time(void);
 extern void opal_nvram_init(void);
 extern void opal_flash_init(void);
+extern int opal_elog_init(void);
+extern void opal_platform_dump_init(void);
 
 extern int opal_machine_check(struct pt_regs *regs);
 extern bool opal_mce_check_early_recovery(struct pt_regs *regs);
