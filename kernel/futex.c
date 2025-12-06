@@ -194,6 +194,8 @@ static void get_futex_key_refs(union futex_key *key)
 	case FUT_OFF_MMSHARED:
 		atomic_inc(&key->private.mm->mm_count);
 		break;
+	default:
+		smp_mb(); /* explicit MB (B) */
 	}
 }
 
@@ -2466,6 +2468,7 @@ static int futex_wait_requeue_pi(u32 __user *uaddr, unsigned int flags,
 	 * shared futexes. We need to compare the keys:
 	 */
 	if (match_futex(&q.key, &key2)) {
+		queue_unlock(&q, hb);
 		ret = -EINVAL;
 		goto out_put_keys;
 	}
