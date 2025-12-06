@@ -36,3 +36,11 @@
 &menet {
 	status = "ok";
 };
+
+&sgenet0 {
+	status = "ok";
+};
+
+&xgenet {
+	status = "ok";
+};
