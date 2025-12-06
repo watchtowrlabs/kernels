@@ -3157,18 +3157,16 @@ static int i8xx_irq_postinstall(struct drm_device *dev)
  * Returns true when a page flip has completed.
  */
 static bool i8xx_handle_vblank(struct drm_device *dev,
-			       int pipe, u16 iir)
+			       int plane, int pipe, u32 iir)
 {
 	drm_i915_private_t *dev_priv = dev->dev_private;
-	u16 flip_pending = DISPLAY_PLANE_FLIP_PENDING(pipe);
+	u16 flip_pending = DISPLAY_PLANE_FLIP_PENDING(plane);
 
 	if (!drm_handle_vblank(dev, pipe))
 		return false;
 
 	if ((iir & flip_pending) == 0)
 		return false;
-
-	intel_prepare_page_flip(dev, pipe);
 
 	/* We detect FlipDone by looking for the change in PendingFlip from '1'
 	 * to '0' on the following vblank, i.e. IIR has the Pendingflip
@@ -3179,6 +3177,7 @@ static bool i8xx_handle_vblank(struct drm_device *dev,
 	if (I915_READ16(ISR) & flip_pending)
 		return false;
 
+	intel_prepare_page_flip(dev, plane);
 	intel_finish_page_flip(dev, pipe);
 
 	return true;
@@ -3237,9 +3236,13 @@ static irqreturn_t i8xx_irq_handler(int irq, void *arg)
 			notify_ring(dev, &dev_priv->ring[RCS]);
 
 		for_each_pipe(pipe) {
+			int plane = pipe;
+			if (I915_HAS_FBC(dev))
+				plane = !plane;
+
 			if (pipe_stats[pipe] & PIPE_VBLANK_INTERRUPT_STATUS &&
-			    i8xx_handle_vblank(dev, pipe, iir))
-				flip_mask &= ~DISPLAY_PLANE_FLIP_PENDING(pipe);
+			    i8xx_handle_vblank(dev, plane, pipe, iir))
+				flip_mask &= ~DISPLAY_PLANE_FLIP_PENDING(plane);
 
 			if (pipe_stats[pipe] & PIPE_CRC_DONE_INTERRUPT_STATUS)
 				i9xx_pipe_crc_irq_handler(dev, pipe);
@@ -3351,8 +3354,6 @@ static bool i915_handle_vblank(struct drm_device *dev,
 	if ((iir & flip_pending) == 0)
 		return false;
 
-	intel_prepare_page_flip(dev, plane);
-
 	/* We detect FlipDone by looking for the change in PendingFlip from '1'
 	 * to '0' on the following vblank, i.e. IIR has the Pendingflip
 	 * asserted following the MI_DISPLAY_FLIP, but ISR is deasserted, hence
@@ -3362,6 +3363,7 @@ static bool i915_handle_vblank(struct drm_device *dev,
 	if (I915_READ(ISR) & flip_pending)
 		return false;
 
+	intel_prepare_page_flip(dev, plane);
 	intel_finish_page_flip(dev, pipe);
 
 	return true;
@@ -3435,7 +3437,7 @@ static irqreturn_t i915_irq_handler(int irq, void *arg)
 
 		for_each_pipe(pipe) {
 			int plane = pipe;
-			if (IS_MOBILE(dev))
+			if (I915_HAS_FBC(dev))
 				plane = !plane;
 
 			if (pipe_stats[pipe] & PIPE_VBLANK_INTERRUPT_STATUS &&

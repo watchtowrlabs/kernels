@@ -433,7 +433,7 @@ struct sw_flow *ovs_flow_tbl_lookup(struct flow_table *tbl,
 				    const struct sw_flow_key *key,
 				    u32 *n_mask_hit)
 {
-	struct table_instance *ti = rcu_dereference(tbl->ti);
+	struct table_instance *ti = rcu_dereference_ovsl(tbl->ti);
 	struct sw_flow_mask *mask;
 	struct sw_flow *flow;
 
@@ -442,6 +442,22 @@ struct sw_flow *ovs_flow_tbl_lookup(struct flow_table *tbl,
 		(*n_mask_hit)++;
 		flow = masked_flow_lookup(ti, key, mask);
 		if (flow)  /* Found */
+			return flow;
+	}
+	return NULL;
+}
+
+struct sw_flow *ovs_flow_tbl_lookup_exact(struct flow_table *tbl,
+					  struct sw_flow_match *match)
+{
+	struct table_instance *ti = rcu_dereference_ovsl(tbl->ti);
+	struct sw_flow_mask *mask;
+	struct sw_flow *flow;
+
+	/* Always called under ovs-mutex. */
+	list_for_each_entry(mask, &tbl->mask_list, list) {
+		flow = masked_flow_lookup(ti, match->key, mask);
+		if (flow && ovs_flow_cmp_unmasked_key(flow, match))  /* Found */
 			return flow;
 	}
 	return NULL;
