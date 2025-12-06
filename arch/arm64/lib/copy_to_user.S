@@ -32,5 +32,33 @@ ENDPROC(__copy_to_user)
 
 	.section .fixup,"ax"
 	.align    2
-	copy_abort_table
+8:
+10:
+	/*
+	 * count is accurate
+	 */
+	mov	x0, count
+	b	.Lfinalize
+9:
+	/*
+	 * 16 bytes remain
+	 */
+	mov	x0, #16
+	b	.Lfinalize
+11:
+	/*
+	 *(count + tmp2) bytes remain
+	 * dst points to the start of the remaining bytes
+	 */
+	add	x0, count, tmp2
+	b	.Lfinalize
+12:
+13:
+	/*
+	 * (count + 128) bytes remain
+	 */
+	add	x0, count, #128
+	b	.Lfinalize
+.Lfinalize:
+	ret
 	.previous

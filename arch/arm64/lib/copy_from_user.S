@@ -32,5 +32,58 @@ ENDPROC(__copy_from_user)
 
 	.section .fixup,"ax"
 	.align    2
-	copy_abort_table
+8:
+	/*
+	 * Count bytes remain
+	 * dst points to (dst + tmp1)
+	 */
+	mov	x0, count
+	sub	dst, dst, tmp1
+	b	.Lfinalize
+9:
+	/*
+	 * 16 bytes remain
+	 * dst is accurate
+	 */
+	mov	x0, #16
+	b	.Lfinalize
+10:
+	/*
+	 * count is accurate
+	 * dst is accurate
+	 */
+	mov	x0, count
+	b	.Lfinalize
+11:
+	/*
+	 *(count + tmp2) bytes remain
+	 * dst points to the start of the remaining bytes
+	 */
+	add	x0, count, tmp2
+	b	.Lfinalize
+12:
+	/*
+	 * (count + 128) bytes remain
+	 * dst is accurate
+	 */
+	add	x0, count, #128
+	b	.Lfinalize
+13:
+	/*
+	 * (count + 128) bytes remain
+	 * dst is pre-biased to (dst + 16)
+	 */
+	add	x0, count, #128
+	add	dst, dst, #16
+.Lfinalize:
+	/*
+	 * Zeroize remaining destination-buffer
+	 */
+	mov	count, x0
+20:
+	/* Zero remaining buffer space */
+	strb	wzr, [dst], #1
+	subs	count, count, #1
+	b.ne	20b
+	ret
 	.previous
