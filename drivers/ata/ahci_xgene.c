@@ -67,6 +67,9 @@
 #define PORTAXICFG			0x000000bc
 #define PORTAXICFG_OUTTRANS_SET(dst, src) \
 		(((dst) & ~0x00f00000) | (((u32)(src) << 0x14) & 0x00f00000))
+#define PORTRANSCFG			0x000000c8
+#define PORTRANSCFG_RXWM_SET(dst, src)		\
+		(((dst) & ~0x0000007f) | (((u32)(src)) & 0x0000007f))
 
 /* SATA host controller AXI CSR */
 #define INT_SLV_TMOMASK			0x00000010
@@ -78,7 +81,7 @@
 struct xgene_ahci_context {
 	struct ahci_host_priv *hpriv;
 	struct device *dev;
-	u8 last_cmd[MAX_AHCI_CHN_PERCTR]; /* tracking the last command */
+	u8 last_cmd[MAX_AHCI_CHN_PERCTR]; /* tracking the last command issued*/
 	void __iomem *csr_core;		/* Core CSR address of IP */
 	void __iomem *csr_diag;		/* Diag CSR address of IP */
 	void __iomem *csr_axi;		/* AXI CSR address of IP */
@@ -99,14 +102,30 @@ static int xgene_ahci_init_memram(struct xgene_ahci_context *ctx)
 }
 
 /**
+ * xgene_ahci_restart_engine - Restart the dma engine.
+ * @ap : ATA port of interest
+ *
+ * Restarts the dma engine inside the controller.
+ */
+static int xgene_ahci_restart_engine(struct ata_port *ap)
+{
+	struct ahci_host_priv *hpriv = ap->host->private_data;
+
+	ahci_stop_engine(ap);
+	ahci_start_fis_rx(ap);
+	hpriv->start_engine(ap);
+
+	return 0;
+}
+
+/**
  * xgene_ahci_qc_issue - Issue commands to the device
  * @qc: Command to issue
  *
- * Due to H/W errata, for the IDENTIFY DEVICE command controller is unable to
- * clear the BSY bit after receiving the PIO setup FIS and results the dma
- * state machine to go into the CMFatalErrorUpdate state resulting in the dma
- * state machine lockup. By restarting the dma engine to move it removes the
- * controller out of lock up state.
+ * Due to Hardware errata for IDENTIFY DEVICE command, the controller cannot
+ * clear the BSY bit after receiving the PIO setup FIS. This results in the dma
+ * state machine goes into the CMFatalErrorUpdate state and locks up. By
+ * restarting the dma engine, it removes the controller out of lock up state.
  */
 static unsigned int xgene_ahci_qc_issue(struct ata_queued_cmd *qc)
 {
@@ -115,12 +134,8 @@ static unsigned int xgene_ahci_qc_issue(struct ata_queued_cmd *qc)
 	struct xgene_ahci_context *ctx = hpriv->plat_data;
 	int rc = 0;
 
-	/*
-	 * Restart the dma engine if the last cmd issued
-	 * is IDENTIFY DEVICE command
-	 */
 	if (unlikely(ctx->last_cmd[ap->port_no] == ATA_CMD_ID_ATA))
-		ahci_restart_engine(ap);
+		xgene_ahci_restart_engine(ap);
 
 	rc = ahci_qc_issue(qc);
 
@@ -181,11 +196,11 @@ static void xgene_ahci_set_phy_cfg(struct xgene_ahci_context *ctx, int channel)
 	/* Disable fix rate */
 	writel(0x0001fffe, mmio + PORTPHY1CFG);
 	readl(mmio + PORTPHY1CFG); /* Force a barrier */
-	writel(0x5018461c, mmio + PORTPHY2CFG);
+	writel(0x28183219, mmio + PORTPHY2CFG);
 	readl(mmio + PORTPHY2CFG); /* Force a barrier */
-	writel(0x1c081907, mmio + PORTPHY3CFG);
+	writel(0x13081008, mmio + PORTPHY3CFG);
 	readl(mmio + PORTPHY3CFG); /* Force a barrier */
-	writel(0x1c080815, mmio + PORTPHY4CFG);
+	writel(0x00480815, mmio + PORTPHY4CFG);
 	readl(mmio + PORTPHY4CFG); /* Force a barrier */
 	/* Set window negotiation */
 	val = readl(mmio + PORTPHY5CFG);
@@ -197,6 +212,10 @@ static void xgene_ahci_set_phy_cfg(struct xgene_ahci_context *ctx, int channel)
 	val = PORTAXICFG_OUTTRANS_SET(val, 0xe); /* Set outstanding */
 	writel(val, mmio + PORTAXICFG);
 	readl(mmio + PORTAXICFG); /* Force a barrier */
+	/* Set the watermark threshold of the receive FIFO */
+	val = readl(mmio + PORTRANSCFG);
+	val = PORTRANSCFG_RXWM_SET(val, 0x30);
+	writel(val, mmio + PORTRANSCFG);
 }
 
 /**
