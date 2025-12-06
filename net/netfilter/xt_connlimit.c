@@ -36,6 +36,8 @@ struct xt_connlimit_conn {
 	struct hlist_node		node;
 	struct nf_conntrack_tuple	tuple;
 	union nf_inet_addr		addr;
+	int				cpu;
+	u32				jiffies32;
 };
 
 struct xt_connlimit_data {
@@ -92,6 +94,35 @@ same_source_net(const union nf_inet_addr *addr,
 	}
 }
 
+static const struct nf_conntrack_tuple_hash *
+find_or_evict(struct net *net, struct xt_connlimit_conn *conn)
+{
+	const struct nf_conntrack_tuple_hash *found;
+	unsigned long a, b;
+	int cpu = raw_smp_processor_id();
+	u32 age;
+
+	found = nf_conntrack_find_get(net, NF_CT_DEFAULT_ZONE, &conn->tuple);
+	if (found)
+		return found;
+	b = conn->jiffies32;
+	a = (u32)jiffies;
+
+	/* conn might have been added just before by another cpu and
+	 * might still be unconfirmed.  In this case, nf_conntrack_find()
+	 * returns no result.  Thus only evict if this cpu added the
+	 * stale entry or if the entry is older than two jiffies.
+	 */
+	age = a - b;
+	if (conn->cpu == cpu || age >= 2) {
+		hlist_del(&conn->node);
+		kfree(conn);
+		return ERR_PTR(-ENOENT);
+	}
+
+	return ERR_PTR(-EAGAIN);
+}
+
 static int count_them(struct net *net,
 		      struct xt_connlimit_data *data,
 		      const struct nf_conntrack_tuple *tuple,
@@ -101,8 +132,8 @@ static int count_them(struct net *net,
 {
 	const struct nf_conntrack_tuple_hash *found;
 	struct xt_connlimit_conn *conn;
-	struct hlist_node *n;
 	struct nf_conn *found_ct;
+	struct hlist_node *n;
 	struct hlist_head *hash;
 	bool addit = true;
 	int matches = 0;
@@ -116,31 +147,24 @@ static int count_them(struct net *net,
 
 	/* check the saved connections */
 	hlist_for_each_entry_safe(conn, n, hash, node) {
-		found    = nf_conntrack_find_get(net, NF_CT_DEFAULT_ZONE,
-						 &conn->tuple);
-		found_ct = NULL;
+		found = find_or_evict(net, conn);
+		if (IS_ERR(found)) {
+			/* Not found, but might be about to be confirmed */
+			if (PTR_ERR(found) == -EAGAIN)
+				matches++;
+			continue;
+		}
 
-		if (found != NULL)
-			found_ct = nf_ct_tuplehash_to_ctrack(found);
+		found_ct = nf_ct_tuplehash_to_ctrack(found);
 
-		if (found_ct != NULL &&
-		    nf_ct_tuple_equal(&conn->tuple, tuple) &&
-		    !already_closed(found_ct))
+		if (nf_ct_tuple_equal(&conn->tuple, tuple)) {
 			/*
 			 * Just to be sure we have it only once in the list.
 			 * We should not see tuples twice unless someone hooks
 			 * this into a table without "-p tcp --syn".
 			 */
 			addit = false;
-
-		if (found == NULL) {
-			/* this one is gone */
-			hlist_del(&conn->node);
-			kfree(conn);
-			continue;
-		}
-
-		if (already_closed(found_ct)) {
+		} else if (already_closed(found_ct)) {
 			/*
 			 * we do not care about connections which are
 			 * closed already -> ditch it
@@ -166,6 +190,8 @@ static int count_them(struct net *net,
 			return -ENOMEM;
 		conn->tuple = *tuple;
 		conn->addr = *addr;
+		conn->cpu = raw_smp_processor_id();
+		conn->jiffies32 = (u32)jiffies;
 		hlist_add_head(&conn->node, hash);
 		++matches;
 	}
