@@ -327,6 +327,8 @@ MODULE_PARM_DESC(storvsc_ringbuffer_size, "Ring buffer size (bytes)");
  */
 static int storvsc_timeout = 180;
 
+static int msft_blist_flags = BLIST_TRY_VPD_PAGES;
+
 #define STORVSC_MAX_IO_REQUESTS				200
 
 static void storvsc_on_channel_callback(void *context);
@@ -1450,12 +1452,12 @@ static int storvsc_device_configure(struct scsi_device *sdevice)
 	sdevice->no_write_same = 1;
 
 	/*
-	 * hyper-v lies about its capabilities indicating it is only SPC-2
-	 * compliant, but actually implements the core SPC-3 features.
-	 * If we pretend to be SPC-3, we send RC16 which activates trim and
-	 * will query the appropriate VPD pages to enable trim.
+	 * Add blist flags to permit the reading of the VPD pages even when
+	 * the target may claim SPC-2 compliance. MSFT targets currently
+	 * claim SPC-2 compliance while they implement post SPC-2 features.
+	 * With this patch we can correctly handle WRITE_SAME_16 issues.
 	 */
-	sdevice->scsi_level = SCSI_SPC_3;
+	sdevice->sdev_bflags |= msft_blist_flags;
 
 	return 0;
 }

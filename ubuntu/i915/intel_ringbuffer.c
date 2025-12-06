@@ -33,6 +33,13 @@
 #include "i915_trace.h"
 #include "intel_drv.h"
 
+/* Early gen2 devices have a cacheline of just 32 bytes, using 64 is overkill,
+ * but keeps the logic simple. Indeed, the whole purpose of this macro is just
+ * to give some inclination as to some of the magic values used in the various
+ * workarounds!
+ */
+#define CACHELINE_BYTES 64
+
 static inline int ring_space(struct intel_ring_buffer *ring)
 {
 	int space = (ring->head & HEAD_ADDR) - (ring->tail + I915_RING_FREE_SPACE);
@@ -175,7 +182,7 @@ gen4_render_ring_flush(struct intel_ring_buffer *ring,
 static int
 intel_emit_post_sync_nonzero_flush(struct intel_ring_buffer *ring)
 {
-	u32 scratch_addr = ring->scratch.gtt_offset + 128;
+	u32 scratch_addr = ring->scratch.gtt_offset + 2 * CACHELINE_BYTES;
 	int ret;
 
 
@@ -212,7 +219,7 @@ gen6_render_ring_flush(struct intel_ring_buffer *ring,
                          u32 invalidate_domains, u32 flush_domains)
 {
 	u32 flags = 0;
-	u32 scratch_addr = ring->scratch.gtt_offset + 128;
+	u32 scratch_addr = ring->scratch.gtt_offset + 2 * CACHELINE_BYTES;
 	int ret;
 
 	/* Force SNB workarounds for PIPE_CONTROL flushes */
@@ -306,7 +313,7 @@ gen7_render_ring_flush(struct intel_ring_buffer *ring,
 		       u32 invalidate_domains, u32 flush_domains)
 {
 	u32 flags = 0;
-	u32 scratch_addr = ring->scratch.gtt_offset + 128;
+	u32 scratch_addr = ring->scratch.gtt_offset + 2 * CACHELINE_BYTES;
 	int ret;
 
 	/*
@@ -363,11 +370,32 @@ gen7_render_ring_flush(struct intel_ring_buffer *ring,
 }
 
 static int
+gen8_emit_pipe_control(struct intel_engine_cs *ring,
+		       u32 flags, u32 scratch_addr)
+{
+	int ret;
+
+	ret = intel_ring_begin(ring, 6);
+	if (ret)
+		return ret;
+
+	intel_ring_emit(ring, GFX_OP_PIPE_CONTROL(6));
+	intel_ring_emit(ring, flags);
+	intel_ring_emit(ring, scratch_addr);
+	intel_ring_emit(ring, 0);
+	intel_ring_emit(ring, 0);
+	intel_ring_emit(ring, 0);
+	intel_ring_advance(ring);
+
+	return 0;
+}
+
+static int
 gen8_render_ring_flush(struct intel_ring_buffer *ring,
 		       u32 invalidate_domains, u32 flush_domains)
 {
 	u32 flags = 0;
-	u32 scratch_addr = ring->scratch.gtt_offset + 128;
+	u32 scratch_addr = ring->scratch.gtt_offset + 2 * CACHELINE_BYTES;
 	int ret;
 
 	flags |= PIPE_CONTROL_CS_STALL;
@@ -385,22 +413,17 @@ gen8_render_ring_flush(struct intel_ring_buffer *ring,
 		flags |= PIPE_CONTROL_STATE_CACHE_INVALIDATE;
 		flags |= PIPE_CONTROL_QW_WRITE;
 		flags |= PIPE_CONTROL_GLOBAL_GTT_IVB;
+
+		/* WaCsStallBeforeStateCacheInvalidate:bdw,chv */
+		ret = gen8_emit_pipe_control(ring,
+					     PIPE_CONTROL_CS_STALL |
+					     PIPE_CONTROL_STALL_AT_SCOREBOARD,
+					     0);
+		if (ret)
+			return ret;
 	}
 
-	ret = intel_ring_begin(ring, 6);
-	if (ret)
-		return ret;
-
-	intel_ring_emit(ring, GFX_OP_PIPE_CONTROL(6));
-	intel_ring_emit(ring, flags);
-	intel_ring_emit(ring, scratch_addr);
-	intel_ring_emit(ring, 0);
-	intel_ring_emit(ring, 0);
-	intel_ring_emit(ring, 0);
-	intel_ring_advance(ring);
-
-	return 0;
-
+	return gen8_emit_pipe_control(ring, flags, scratch_addr);
 }
 
 static void ring_write_tail(struct intel_ring_buffer *ring,
@@ -579,6 +602,72 @@ err_unref:
 	drm_gem_object_unreference(&ring->scratch.obj->base);
 err:
 	return ret;
+}
+
+static inline void intel_ring_emit_wa(struct intel_ring_buffer *ring,
+				       u32 addr, u32 value)
+{
+	intel_ring_emit(ring, MI_LOAD_REGISTER_IMM(1));
+	intel_ring_emit(ring, addr);
+	intel_ring_emit(ring, value);
+}
+
+static int gen8_init_workarounds(struct intel_ring_buffer *ring)
+{
+	int ret;
+
+	/*
+	 * workarounds applied in this fn are part of register state context,
+	 * they need to be re-initialized followed by gpu reset, suspend/resume,
+	 * module reload.
+	 */
+
+	/*
+	 * update the number of dwords required based on the
+	 * actual number of workarounds applied
+	 */
+	ret = intel_ring_begin(ring, 18);
+	if (ret)
+		return ret;
+
+	/* WaDisablePartialInstShootdown:bdw */
+	/* WaDisableThreadStallDopClockGating:bdw (pre-production until D) */
+	intel_ring_emit_wa(ring, GEN8_ROW_CHICKEN,
+			   _MASKED_BIT_ENABLE(PARTIAL_INSTRUCTION_SHOOTDOWN_DISABLE
+					     | STALL_DOP_GATING_DISABLE));
+
+	/* WaDisableDopClockGating:bdw */
+	intel_ring_emit_wa(ring, GEN7_ROW_CHICKEN2,
+			   _MASKED_BIT_ENABLE(DOP_CLOCK_GATING_DISABLE));
+
+	intel_ring_emit_wa(ring, HALF_SLICE_CHICKEN3,
+			   _MASKED_BIT_ENABLE(GEN8_SAMPLER_POWER_BYPASS_DIS));
+
+	/* Use Force Non-Coherent whenever executing a 3D context. This is a
+	 * workaround for for a possible hang in the unlikely event a TLB
+	 * invalidation occurs during a PSD flush.
+	 */
+	intel_ring_emit_wa(ring, HDC_CHICKEN0,
+			   _MASKED_BIT_ENABLE(HDC_FORCE_NON_COHERENT));
+
+	/* Wa4x4STCOptimizationDisable:bdw */
+	intel_ring_emit_wa(ring, CACHE_MODE_1,
+			   _MASKED_BIT_ENABLE(GEN8_4x4_STC_OPTIMIZATION_DISABLE));
+
+	/*
+	 * BSpec recommends 8x4 when MSAA is used,
+	 * however in practice 16x4 seems fastest.
+	 *
+	 * Note that PS/WM thread counts depend on the WIZ hashing
+	 * disable bit, which we don't touch here, but it's good
+	 * to keep in mind (see 3DSTATE_PS and 3DSTATE_WM).
+	 */
+	intel_ring_emit_wa(ring, GEN7_GT_MODE,
+			   GEN6_WIZ_HASHING_MASK | GEN6_WIZ_HASHING_16x4);
+
+	intel_ring_advance(ring);
+
+	return 0;
 }
 
 static int init_render_ring(struct intel_ring_buffer *ring)
@@ -784,7 +873,7 @@ do {									\
 static int
 pc_render_add_request(struct intel_ring_buffer *ring)
 {
-	u32 scratch_addr = ring->scratch.gtt_offset + 128;
+	u32 scratch_addr = ring->scratch.gtt_offset + 2 * CACHELINE_BYTES;
 	int ret;
 
 	/* For Ironlake, MI_USER_INTERRUPT was deprecated and apparently
@@ -806,15 +895,15 @@ pc_render_add_request(struct intel_ring_buffer *ring)
 	intel_ring_emit(ring, ring->outstanding_lazy_seqno);
 	intel_ring_emit(ring, 0);
 	PIPE_CONTROL_FLUSH(ring, scratch_addr);
-	scratch_addr += 128; /* write to separate cachelines */
+	scratch_addr += 2 * CACHELINE_BYTES; /* write to separate cachelines */
 	PIPE_CONTROL_FLUSH(ring, scratch_addr);
-	scratch_addr += 128;
+	scratch_addr += 2 * CACHELINE_BYTES;
 	PIPE_CONTROL_FLUSH(ring, scratch_addr);
-	scratch_addr += 128;
+	scratch_addr += 2 * CACHELINE_BYTES;
 	PIPE_CONTROL_FLUSH(ring, scratch_addr);
-	scratch_addr += 128;
+	scratch_addr += 2 * CACHELINE_BYTES;
 	PIPE_CONTROL_FLUSH(ring, scratch_addr);
-	scratch_addr += 128;
+	scratch_addr += 2 * CACHELINE_BYTES;
 	PIPE_CONTROL_FLUSH(ring, scratch_addr);
 
 	intel_ring_emit(ring, GFX_OP_PIPE_CONTROL(4) | PIPE_CONTROL_QW_WRITE |
@@ -1423,7 +1512,7 @@ static int intel_init_ring_buffer(struct drm_device *dev,
 	 */
 	ring->effective_size = ring->size;
 	if (IS_I830(ring->dev) || IS_845G(ring->dev))
-		ring->effective_size -= 128;
+		ring->effective_size -= 2 * CACHELINE_BYTES;
 
 	i915_cmd_parser_init_ring(ring);
 
@@ -1684,12 +1773,13 @@ int intel_ring_begin(struct intel_ring_buffer *ring,
 /* Align the ring tail to a cacheline boundary */
 int intel_ring_cacheline_align(struct intel_ring_buffer *ring)
 {
-	int num_dwords = (64 - (ring->tail & 63)) / sizeof(uint32_t);
+	int num_dwords = (ring->tail & (CACHELINE_BYTES - 1)) / sizeof(uint32_t);
 	int ret;
 
 	if (num_dwords == 0)
 		return 0;
 
+	num_dwords = CACHELINE_BYTES / sizeof(uint32_t) - num_dwords;
 	ret = intel_ring_begin(ring, num_dwords);
 	if (ret)
 		return ret;
@@ -1904,6 +1994,10 @@ int intel_init_render_ring_buffer(struct drm_device *dev)
 	ring->id = RCS;
 	ring->mmio_base = RENDER_RING_BASE;
 
+
+	if (INTEL_INFO(dev)->gen >= 8) {
+		ring->init_context = gen8_init_workarounds;
+	}
 	if (INTEL_INFO(dev)->gen >= 6) {
 		ring->add_request = gen6_add_request;
 		ring->flush = gen7_render_ring_flush;
@@ -2046,7 +2140,7 @@ int intel_render_ring_init_dri(struct drm_device *dev, u64 start, u32 size)
 	ring->size = size;
 	ring->effective_size = ring->size;
 	if (IS_I830(ring->dev) || IS_845G(ring->dev))
-		ring->effective_size -= 128;
+		ring->effective_size -= 2 * CACHELINE_BYTES;
 
 	ring->virtual_start = ioremap_wc(start, size);
 	if (ring->virtual_start == NULL) {
