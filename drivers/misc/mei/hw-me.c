@@ -184,7 +184,7 @@ static int mei_me_hw_reset(struct mei_device *dev, bool intr_enable)
 	if ((hcsr & H_RST) == H_RST) {
 		dev_warn(&dev->pdev->dev, "H_RST is set = 0x%08X", hcsr);
 		hcsr &= ~H_RST;
-		mei_me_reg_write(hw, H_CSR, hcsr);
+		mei_hcsr_set(hw, hcsr);
 		hcsr = mei_hcsr_read(hw);
 	}
 
@@ -271,6 +271,7 @@ static int mei_me_hw_ready_wait(struct mei_device *dev)
 		return err;
 	}
 
+	mei_me_hw_reset_release(dev);
 	dev->recvd_hw_ready = false;
 	return 0;
 }
