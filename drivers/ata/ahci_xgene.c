@@ -78,6 +78,9 @@
 #define CFG_MEM_RAM_SHUTDOWN		0x00000070
 #define BLOCK_MEM_RDY			0x00000074
 
+/* Max retry for link down */
+#define MAX_LINK_DOWN_RETRY 3
+
 struct xgene_ahci_context {
 	struct ahci_host_priv *hpriv;
 	struct device *dev;
@@ -143,6 +146,16 @@ static unsigned int xgene_ahci_qc_issue(struct ata_queued_cmd *qc)
 	ctx->last_cmd[ap->port_no] = qc->tf.command;
 
 	return rc;
+}
+
+static int xgene_ahci_is_memram_inited(struct xgene_ahci_context *ctx)
+{
+	void __iomem *diagcsr = ctx->csr_diag;
+
+	if (readl(diagcsr + CFG_MEM_RAM_SHUTDOWN) == 0 &&
+	    readl(diagcsr + BLOCK_MEM_RDY) == 0xFFFFFFFF)
+		return 1;
+	return 0;
 }
 
 /**
@@ -267,15 +280,23 @@ static int xgene_ahci_do_hardreset(struct ata_link *link,
 	u8 *d2h_fis = pp->rx_fis + RX_FIS_D2H_REG;
 	void __iomem *port_mmio = ahci_port_base(ap);
 	struct ata_taskfile tf;
+	int link_down_retry = 0;
 	int rc;
-	u32 val;
+	u32 val, sstatus;
 
-	/* clear D2H reception area to properly wait for D2H FIS */
-	ata_tf_init(link->device, &tf);
-	tf.command = ATA_BUSY;
-	ata_tf_to_fis(&tf, 0, 0, d2h_fis);
-	rc = sata_link_hardreset(link, timing, deadline, online,
+	do {
+		/* clear D2H reception area to properly wait for D2H FIS */
+		ata_tf_init(link->device, &tf);
+		tf.command = ATA_BUSY;
+		ata_tf_to_fis(&tf, 0, 0, d2h_fis);
+		rc = sata_link_hardreset(link, timing, deadline, online,
 				 ahci_check_ready);
+		if (*online)
+			break;
+
+		sata_scr_read(link, SCR_STATUS, &sstatus);
+	} while (link_down_retry++ < MAX_LINK_DOWN_RETRY &&
+		 (sstatus & 0xff) == 0x1);
 
 	val = readl(port_mmio + PORT_SCR_ERR);
 	if (val & (SERR_DISPARITY | SERR_10B_8B_ERR))
@@ -344,8 +365,8 @@ static struct ata_port_operations xgene_ahci_ops = {
 };
 
 static const struct ata_port_info xgene_ahci_port_info = {
-	AHCI_HFLAGS(AHCI_HFLAG_NO_PMP | AHCI_HFLAG_YES_NCQ),
-	.flags = AHCI_FLAG_COMMON | ATA_FLAG_NCQ,
+	AHCI_HFLAGS(AHCI_HFLAG_NO_PMP | AHCI_HFLAG_NO_NCQ),
+	.flags = AHCI_FLAG_COMMON,
 	.pio_mask = ATA_PIO4,
 	.udma_mask = ATA_UDMA6,
 	.port_ops = &xgene_ahci_ops,
@@ -468,6 +489,11 @@ static int xgene_ahci_probe(struct platform_device *pdev)
 		return -ENODEV;
 	}
 
+	if (xgene_ahci_is_memram_inited(ctx)) {
+		dev_info(dev, "skip clock and PHY initialization\n");
+		goto skip_clk_phy;
+	}
+
 	/* Due to errata, HW requires full toggle transition */
 	rc = ahci_platform_enable_clks(hpriv);
 	if (rc)
@@ -480,6 +506,8 @@ static int xgene_ahci_probe(struct platform_device *pdev)
 
 	/* Configure the host controller */
 	xgene_ahci_hw_init(hpriv);
+
+skip_clk_phy:
 
 	/*
 	 * Setup DMA mask. This is preliminary until the DMA range is sorted
